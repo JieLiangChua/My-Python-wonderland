@@ -48,6 +48,9 @@ tower create_main_tower(){
     main_tower.damage = GAME_CONFIG.MAIN_TOWER.DAMAGE;
     main_tower.health = GAME_CONFIG.MAIN_TOWER.HEALTH;
     main_tower.max_health = GAME_CONFIG.MAIN_TOWER.MAX_HEALTH;
+    main_tower.range = GAME_CONFIG.MAIN_TOWER.RANGE;
+    main_tower.level = 1;
+    main_tower.cooldown = 0;
     return main_tower;
 }
 
@@ -58,6 +61,10 @@ tower create_sub_tower(double x, double y){
     sub_tower.damage = GAME_CONFIG.SUB_TOWER.DAMAGE;
     sub_tower.health = GAME_CONFIG.SUB_TOWER.HEALTH;
     sub_tower.max_health = GAME_CONFIG.SUB_TOWER.MAX_HEALTH;
+    sub_tower.is_main_tower = false;
+    sub_tower.level = GAME_CONFIG.SUB_TOWER.INITIAL_LEVEL;
+    sub_tower.range = GAME_CONFIG.SUB_TOWER.RANGE;
+    sub_tower.cooldown = GAME_CONFIG.SUB_TOWER.ATTACK_COOLDOWN;
     return sub_tower;
 }
 
@@ -68,8 +75,8 @@ void init_grid(game_session &session){
         }
     }
 
-    for(int r = GAME_CONFIG.MAIN_TOWER_GRID_START; r < GAME_CONFIG.MAIN_TOWER_GRID_END; r++){
-        for(int c = GAME_CONFIG.MAIN_TOWER_GRID_START; c < GAME_CONFIG.MAIN_TOWER_GRID_END; c++){
+    for(int r = GAME_CONFIG.MAIN_TOWER_GRID_START; r <= GAME_CONFIG.MAIN_TOWER_GRID_END; r++){
+        for(int c = GAME_CONFIG.MAIN_TOWER_GRID_START; c <= GAME_CONFIG.MAIN_TOWER_GRID_END; c++){
             session.grid[r][c].single_tile = MAIN_TOWER_TILE;
         }
     }
@@ -84,6 +91,8 @@ void init_game_session(game_session &session){
     session.bullets = {};
     session.monsters = {};
     session.towers = {};
+    
+    session.spawn_timer = 0;
 
     init_grid(session);
     tower main_tower = create_main_tower();
@@ -139,7 +148,16 @@ void spawn_monster(game_session &session){
 }
 
 void update_wave(game_session &session){
-    if(session.monster_left_to_spawn <= 0){
+    if(session.monster_left_to_spawn > 0){
+        session.spawn_timer++;
+        if(session.spawn_timer >= GAME_CONFIG.SESSION.INITIAL_SPAWN_INTERVAL){
+            spawn_monster(session);
+            session.monster_left_to_spawn--;
+            session.spawn_timer = 0;
+        }
+    }
+    else if(length(session.monsters) == 0){
+        delay(GAME_CONFIG.SESSION.WAVE_TRANSITION_DELAY_MS); // 1000
         session.wave_number++;
         session.monster_left_to_spawn = GAME_CONFIG.SESSION.INITIAL_MONSTER_TO_SPAWN * session.wave_number;
     }
@@ -220,14 +238,7 @@ void update_tower(game_session &session){
         }
     
         int target_monster_index = -1;
-        double min_distance;
-
-        if(session.towers[i].is_main_tower){
-            min_distance = GAME_CONFIG.MAIN_TOWER.RANGE;
-        }
-        else{
-            min_distance = GAME_CONFIG.SUB_TOWER.RANGE;
-        }
+        double min_distance = session.towers[i].range;
 
         for(int j = 0; j < length(session.monsters); j++){
             if(!session.monsters[j].alive) continue;
@@ -242,7 +253,21 @@ void update_tower(game_session &session){
 
 
         if(target_monster_index != -1){
-            bullet b = create_bullet(session.towers[i].x, session.towers[i].y, session.monsters[target_monster_index].x, session.monsters[target_monster_index].y, session.towers[i].damage);
+            int bullet_damage = session.towers[i].damage;
+            bool bullet_strike = false;
+
+            if(session.towers[i].skill == STRIKE_SKILL){
+                int strike_roll = rnd(0, 99);
+                if(strike_roll < GAME_CONFIG.TOWER_SKILL.STRIKE_CHANCE_PERCENT){
+                    bullet_damage *= GAME_CONFIG.TOWER_SKILL.STRIKE_MULTIPLIER;
+                    bullet_strike = true;
+                    write_line("[SYSTEM] STRIKE skill activated! Bullet damage: " + to_string(bullet_damage)); // debug
+                }
+            }
+
+            bullet b = create_bullet(session.towers[i].x, session.towers[i].y, session.monsters[target_monster_index].x, session.monsters[target_monster_index].y, bullet_damage);
+            b.is_strike = bullet_strike;
+
             add(session.bullets, b);
             session.towers[i].cooldown = GAME_CONFIG.SUB_TOWER.ATTACK_COOLDOWN;
         }
@@ -304,7 +329,7 @@ void remove_inactive_bullet(game_session &session){
 
 void apply_tower_upgrade(tower &t){
     t.level++;
-    t.damage += GAME_CONFIG.TOWER_UPGRADE.DAMAGE_INCREMENT;
+    t.damage *= GAME_CONFIG.TOWER_UPGRADE.DAMAGE_MULTIPLIER;
     t.range += GAME_CONFIG.TOWER_UPGRADE.RANGE_INCREMENT;
     t.health += GAME_CONFIG.TOWER_UPGRADE.HEALTH_INCREMENT;
     t.max_health += GAME_CONFIG.TOWER_UPGRADE.HEALTH_INCREMENT;
@@ -315,6 +340,13 @@ bool upgrade_tower(game_session &session, int tower_index){
     if(session.towers[tower_index].is_main_tower || session.towers[tower_index].level >= GAME_CONFIG.SUB_TOWER.MAX_LEVEL || session.currency < upgrade_cost) return false;
     session.currency -= upgrade_cost;
     apply_tower_upgrade(session.towers[tower_index]);
+    return true;
+}
+
+bool evolve_tower(game_session &session, int tower_index, tower_skill skill){
+    if(session.towers[tower_index].is_main_tower || session.towers[tower_index].level != GAME_CONFIG.SUB_TOWER.MAX_LEVEL || session.towers[tower_index].skill != NO_SKILL || session.currency < GAME_CONFIG.TOWER_SKILL.EVOLVE_COST) return false;
+    session.currency -= GAME_CONFIG.TOWER_SKILL.EVOLVE_COST;
+    session.towers[tower_index].skill = skill;
     return true;
 }
 
@@ -332,27 +364,47 @@ bool build_tower(game_session &session, int row, int col){
 }
 
 void handle_input(game_session &session){
-    if(mouse_clicked(LEFT_BUTTON)){
-        double mousex = mouse_x();
-        double mousey = mouse_y();
+    bool left_click = mouse_clicked(LEFT_BUTTON);
+    bool right_click = mouse_clicked(RIGHT_BUTTON);
 
-        double adjusted_x = mousex - GAME_CONFIG.OFFSET_X;
-        double adjusted_y = mousey - GAME_CONFIG.OFFSET_Y;
+    if(!left_click && !right_click) return;
+    
+    double mousex = mouse_x();
+    double mousey = mouse_y();
 
-        if(adjusted_x < 0 || adjusted_x >= GAME_CONFIG.MAP_DIMENSION * GAME_CONFIG.TILE_SIZE || adjusted_y < 0 || adjusted_y >= GAME_CONFIG.MAP_DIMENSION * GAME_CONFIG.TILE_SIZE){
-            return;
-        }
+    double adjusted_x = mousex - GAME_CONFIG.OFFSET_X;
+    double adjusted_y = mousey - GAME_CONFIG.OFFSET_Y;
 
-        int col = adjusted_x / GAME_CONFIG.TILE_SIZE;
-        int row = adjusted_y / GAME_CONFIG.TILE_SIZE;
-
-        if(session.grid[row][col].single_tile == EMPTY_TILE){
-            build_tower(session, row, col);
-        }
-        else if(session.grid[row][col].single_tile == SUB_TOWER_TILE){
-            upgrade_tower(session, session.grid[row][col].tower_index);
-        }
-
-
+    if(adjusted_x < 0 || adjusted_x >= GAME_CONFIG.MAP_DIMENSION * GAME_CONFIG.TILE_SIZE || adjusted_y < 0 || adjusted_y >= GAME_CONFIG.MAP_DIMENSION * GAME_CONFIG.TILE_SIZE){
+        return;
     }
+
+    int col = adjusted_x / GAME_CONFIG.TILE_SIZE;
+    int row = adjusted_y / GAME_CONFIG.TILE_SIZE;
+
+    if(session.grid[row][col].single_tile == EMPTY_TILE){
+        if(left_click){
+            build_tower(session, row, col);
+            write_line("[SYSTEM] Trying to build a sub-tower at row: " + to_string(row) + ", col: " + to_string(col)); // debug
+        }
+    }
+    else if(session.grid[row][col].single_tile == SUB_TOWER_TILE){
+        if(left_click){
+            if(session.towers[session.grid[row][col].tower_index].level < GAME_CONFIG.SUB_TOWER.MAX_LEVEL){
+                upgrade_tower(session, session.grid[row][col].tower_index);
+                write_line("[SYSTEM] Trying to upgrade the sub-tower at row: " + to_string(row) + ", col: " + to_string(col)); // debug
+            }
+            else{
+                evolve_tower(session, session.grid[row][col].tower_index, SLOWNESS_SKILL);
+                write_line("[SYSTEM] Trying to evolve the sub-tower at row: " + to_string(row) + ", col: " + to_string(col) + " to SLOWNESS_SKILL"); // debug
+            }
+        }
+        
+        else if(right_click){
+            evolve_tower(session, session.grid[row][col].tower_index, STRIKE_SKILL);
+            write_line("[SYSTEM] Trying to evolve the sub-tower at row: " + to_string(row) + ", col: " + to_string(col) + " to STRIKE_SKILL"); // debug
+        }
+    }
+
+    write_line("Currency: " + to_string(session.currency));
 }
